@@ -1,6 +1,7 @@
 package kcp
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"fmt"
 	"io"
@@ -557,5 +558,85 @@ func TestListenerClose(t *testing.T) {
 	fakeaddr, _ := net.ResolveUDPAddr("udp6", "127.0.0.1:1111")
 	if l.closeSession(fakeaddr) {
 		t.Fail()
+	}
+}
+
+// Listener should allow multiple sessions that have the same addr (different
+// convs).
+// https://github.com/xtaci/kcp-go/issues/166
+func TestListenerSameAddr(t *testing.T) {
+	l, err := Listen("127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			conn, err := l.(*Listener).AcceptKCP()
+			if err != nil {
+				break
+			}
+			go func() {
+				io.Copy(conn, conn)
+				conn.Close()
+			}()
+		}
+	}()
+
+	// Create one net.PacketConn to share between multiple clients.
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	defer pconn.Close()
+
+	payload1 := []byte("from cli1")
+	payload2 := []byte("from cli2")
+
+	cli1, err := NewConn3(1, l.Addr(), nil, 0, 0, pconn)
+	if err != nil {
+		panic(err)
+	}
+	defer cli1.Close()
+	cli1.SetDeadline(time.Now().Add(10 * time.Second))
+	// Connect cli1 and make sure it is connected.
+	_, err = cli1.Write(payload1)
+	if err != nil {
+		t.Fatalf("cli1 write %v", err)
+	}
+	buf := make([]byte, len(payload1))
+	n, err := cli1.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], payload1) {
+		t.Fatalf("cli1 read %q %v", buf[:n], err)
+	}
+
+	// Put more in the buffer of cli1.
+	_, err = cli1.Write(payload1)
+	if err != nil {
+		t.Fatalf("cli1 write %v", err)
+	}
+
+	// Connect cli2 and make sure it is connected.
+	cli2, err := NewConn3(2, l.Addr(), nil, 0, 0, pconn)
+	if err != nil {
+		panic(err)
+	}
+	defer cli2.Close()
+	cli2.SetDeadline(time.Now().Add(10 * time.Second))
+	_, err = cli2.Write(payload2)
+	if err != nil {
+		t.Fatalf("cli2 write %v", err)
+	}
+	buf = make([]byte, len(payload2))
+	n, err = cli2.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], payload2) {
+		t.Fatalf("cli2 read %q %v", buf[:n], err)
+	}
+
+	// Make sure cli1 is still connected.
+	buf = make([]byte, len(payload1))
+	n, err = cli1.Read(buf)
+	if err != nil || !bytes.Equal(buf[:n], payload1) {
+		t.Fatalf("cli1 read %q %v", buf[:n], err)
 	}
 }
